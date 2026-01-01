@@ -1,23 +1,23 @@
 package com.csc4702.ikga2d;
 
-import javafx.application.Application;
-import javafx.fxml.FXMLLoader;
-import javafx.scene.Scene;
-import javafx.stage.Stage;
-
-import java.io.IOException;
-
-public class HelloApplication extends Application {
-    @Override
-    public void start(Stage stage) throws IOException {
-        FXMLLoader fxmlLoader = new FXMLLoader(HelloApplication.class.getResource("hello-view.fxml"));
-        Scene scene = new Scene(fxmlLoader.load(), 320, 240);
-        stage.setTitle("Hello!");
-        stage.setScene(scene);
-        stage.show();
-    }
-
+/**
+ * Entry point for the GA-based inverse kinematics solver.
+ */
+public class IKApplication {
     public static void main(String[] args) {
-        launch();
+        double targetX = 1.2;
+        double targetY = 0.8;
+
+        if (args.length == 2) {
+            try {
+                targetX = Double.parseDouble(args[0]);
+                targetY = Double.parseDouble(args[1]);
+            } catch (NumberFormatException e) {
+                System.err.println("Invalid arguments. Using default target (1.2, 0.8).");
+            }
+        }
+
+        IKController controller = new IKController(targetX, targetY);
+        controller.runSimulation();
     }
 }
