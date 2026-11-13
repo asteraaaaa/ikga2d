@@ -1,124 +1,156 @@
 package com.csc4702.ikga2d;
 
 import java.util.ArrayList;
-import java.util.Collections;
-import java.util.Comparator;
 import java.util.List;
-import java.util.concurrent.ThreadLocalRandom;
+import java.util.Random;
+import java.util.function.Consumer;
 
 /**
  * Core GA engine that evolves joint angles to minimize the positional error.
  */
 public class GeneticAlgorithm {
+    /** BLX-alpha extension: children may fall slightly outside the parents' range. */
+    private static final double BLX_ALPHA = 0.5;
+    private static final double IMPROVEMENT_EPS = 1e-9;
+
+    /** Snapshot reported to the listener after each generation. */
+    public record GenerationStats(int generation, Individual best, double[] endEffector) {}
+
+    /** Outcome of a run. */
+    public record Result(Individual best, int generations, boolean targetReachable, boolean converged) {}
+
     private final List<Individual> population = new ArrayList<>();
     private final GAParameters parameters;
     private final RobotArm2D robot;
     private final double targetX;
     private final double targetY;
+    private final Random rng;
+    private Consumer<GenerationStats> listener = s -> { };
 
     public GeneticAlgorithm(GAParameters parameters, RobotArm2D robot, double targetX, double targetY) {
         this.parameters = parameters;
         this.robot = robot;
         this.targetX = targetX;
         this.targetY = targetY;
+        this.rng = parameters.getSeed() == null ? new Random() : new Random(parameters.getSeed());
     }
 
-    public Individual run() {
+    /** Registers a callback invoked after every generation (default: none, so runs are silent). */
+    public void setGenerationListener(Consumer<GenerationStats> listener) {
+        this.listener = listener == null ? s -> { } : listener;
+    }
+
+    public Result run() {
+        boolean reachable = robot.isReachable(targetX, targetY);
         initializePopulation();
-        evaluatePopulation();
-        Individual best = getBestIndividual();
+        Individual best = findBest().copy();
+        boolean converged = best.getFitness() < parameters.getTolerance();
+        int stagnant = 0;
+        int generation = 0;
 
-        for (int generation = 1; generation <= parameters.getMaxGenerations(); generation++) {
-            List<Individual> nextGeneration = new ArrayList<>();
-            // Elitism: carry the best individual forward
-            nextGeneration.add(best.clone());
+        while (!converged && generation < parameters.getMaxGenerations()) {
+            generation++;
+            List<Individual> next = new ArrayList<>(parameters.getPopulationSize());
+            next.add(best.copy()); // elitism
 
-            while (nextGeneration.size() < parameters.getPopulationSize()) {
-                Individual parent1 = selectParent();
-                Individual parent2 = selectParent();
-                Individual child = crossover(parent1, parent2);
+            while (next.size() < parameters.getPopulationSize()) {
+                Individual child = crossover(selectParent(), selectParent());
                 mutate(child);
                 child.evaluateFitness(robot, targetX, targetY);
-                nextGeneration.add(child);
+                next.add(child);
             }
-
             population.clear();
-            population.addAll(nextGeneration);
-            best = getBestIndividual();
+            population.addAll(next);
 
-            printGenerationStats(generation, best);
+            Individual current = findBest();
+            stagnant = current.getFitness() < best.getFitness() - IMPROVEMENT_EPS ? 0 : stagnant + 1;
+            best = current.copy();
+            converged = best.getFitness() < parameters.getTolerance();
 
-            if (best.getFitness() < 0.01) {
+            listener.accept(new GenerationStats(generation, best,
+                    robot.computeEndEffector(best.getTheta1(), best.getTheta2())));
+
+            // An unreachable target never converges; stop once progress has stalled.
+            if (!converged && stagnant >= parameters.getStagnationLimit()) {
                 break;
             }
         }
-        return best;
+        return new Result(best, generation, reachable, converged);
     }
 
     private void initializePopulation() {
         population.clear();
         for (int i = 0; i < parameters.getPopulationSize(); i++) {
-            Individual individual = Individual.randomWithinBounds(parameters.getMinAngle(), parameters.getMaxAngle());
-            population.add(individual);
+            Individual ind = Individual.randomWithinBounds(rng, parameters.getMinAngle(), parameters.getMaxAngle());
+            ind.evaluateFitness(robot, targetX, targetY);
+            population.add(ind);
         }
     }
 
-    private void evaluatePopulation() {
-        for (Individual individual : population) {
-            individual.evaluateFitness(robot, targetX, targetY);
+    /** Population fitness is always up to date, so no re-evaluation is needed. */
+    private Individual findBest() {
+        Individual best = population.get(0);
+        for (Individual ind : population) {
+            if (ind.getFitness() < best.getFitness()) best = ind;
         }
+        return best;
     }
 
     private Individual selectParent() {
-        int tournamentSize = Math.max(2, parameters.getPopulationSize() / 10);
-        List<Individual> tournament = new ArrayList<>();
-        ThreadLocalRandom rng = ThreadLocalRandom.current();
-        for (int i = 0; i < tournamentSize; i++) {
-            tournament.add(population.get(rng.nextInt(population.size())));
+        int size = Math.min(population.size(), Math.max(2, parameters.getPopulationSize() / 10));
+        Individual winner = null;
+        for (int i = 0; i < size; i++) {
+            Individual c = population.get(rng.nextInt(population.size()));
+            if (winner == null || c.getFitness() < winner.getFitness()) winner = c;
         }
-        return Collections.min(tournament, Comparator.comparingDouble(Individual::getFitness));
+        return winner;
     }
 
+    /** BLX-alpha crossover: samples each gene from the parents' interval extended by alpha on both sides. */
     private Individual crossover(Individual p1, Individual p2) {
-        ThreadLocalRandom rng = ThreadLocalRandom.current();
-        if (rng.nextDouble() > parameters.getCrossoverRate()) {
-            return p1.clone();
+        Individual child;
+        if (rng.nextDouble() >= parameters.getCrossoverRate()) {
+            child = p1.copy();
+        } else {
+            child = new Individual(blend(p1.getTheta1(), p2.getTheta1()), blend(p1.getTheta2(), p2.getTheta2()));
         }
-        double alpha = rng.nextDouble();
-        double theta1 = alpha * p1.getTheta1() + (1 - alpha) * p2.getTheta1();
-        double theta2 = alpha * p1.getTheta2() + (1 - alpha) * p2.getTheta2();
-        return clamp(new Individual(theta1, theta2));
+        return normalize(child);
     }
 
-    private void mutate(Individual individual) {
-        ThreadLocalRandom rng = ThreadLocalRandom.current();
+    private double blend(double a, double b) {
+        double lo = Math.min(a, b);
+        double hi = Math.max(a, b);
+        double d = hi - lo;
+        double from = lo - BLX_ALPHA * d;
+        double to = hi + BLX_ALPHA * d;
+        return from == to ? a : rng.nextDouble(from, to);
+    }
+
+    private void mutate(Individual ind) {
+        double sigma = parameters.getMutationSigma();
         if (rng.nextDouble() < parameters.getMutationRate()) {
-            double noise = rng.nextGaussian() * 0.05; // small perturbation
-            individual.setTheta1(individual.getTheta1() + noise);
+            ind.setTheta1(ind.getTheta1() + rng.nextGaussian() * sigma);
         }
         if (rng.nextDouble() < parameters.getMutationRate()) {
-            double noise = rng.nextGaussian() * 0.05;
-            individual.setTheta2(individual.getTheta2() + noise);
+            ind.setTheta2(ind.getTheta2() + rng.nextGaussian() * sigma);
         }
-        clamp(individual);
+        normalize(ind);
     }
 
-    private Individual clamp(Individual individual) {
-        individual.setTheta1(Math.max(parameters.getMinAngle(), Math.min(parameters.getMaxAngle(), individual.getTheta1())));
-        individual.setTheta2(Math.max(parameters.getMinAngle(), Math.min(parameters.getMaxAngle(), individual.getTheta2())));
-        return individual;
+    /** Wraps angles around when the range spans a full turn, otherwise clamps to the joint limits. */
+    private Individual normalize(Individual ind) {
+        ind.setTheta1(normalizeAngle(ind.getTheta1()));
+        ind.setTheta2(normalizeAngle(ind.getTheta2()));
+        return ind;
     }
 
-    private Individual getBestIndividual() {
-        evaluatePopulation();
-        return Collections.min(population, Comparator.comparingDouble(Individual::getFitness));
-    }
-
-    private void printGenerationStats(int generation, Individual best) {
-        double[] position = robot.computeEndEffector(best.getTheta1(), best.getTheta2());
-        System.out.printf("Generation %d%n", generation);
-        System.out.printf("Best θ1 = %.4f rad, θ2 = %.4f rad%n", best.getTheta1(), best.getTheta2());
-        System.out.printf("End Effector = (%.4f, %.4f)%n", position[0], position[1]);
-        System.out.printf("Error = %.6f%n%n", best.getFitness());
+    private double normalizeAngle(double angle) {
+        double min = parameters.getMinAngle();
+        double max = parameters.getMaxAngle();
+        double range = max - min;
+        if (range >= 2 * Math.PI - 1e-9) {
+            return min + ((angle - min) % range + range) % range;
+        }
+        return Math.max(min, Math.min(max, angle));
     }
 }
